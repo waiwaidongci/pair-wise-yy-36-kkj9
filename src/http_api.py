@@ -14,6 +14,18 @@ from .service import Service
 def make_handler(service: Service, static_dir: str):
     root = Path(static_dir)
 
+    def item_id_from(path: str) -> int:
+        try:
+            return int(path.split("/")[3])
+        except (IndexError, ValueError) as exc:
+            raise NotFoundError("项目不存在") from exc
+
+    def handoff_id_from(path: str) -> int:
+        try:
+            return int(path.split("/")[3])
+        except (IndexError, ValueError) as exc:
+            raise NotFoundError("交接不存在") from exc
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "ModularHell/1.0"
 
@@ -85,12 +97,12 @@ def make_handler(service: Service, static_dir: str):
                     del actor
                     self._json(200, {"items": service.list_items(role)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
+                    item_id = item_id_from(path)
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
                 elif path.startswith("/api/items/"):
-                    item_id = int(path.rsplit("/", 1)[-1])
+                    item_id = item_id_from(path)
                     actor, role = self._identity()
                     del actor
                     self._json(200, service.get_item(item_id, role))
@@ -110,11 +122,21 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/claim"):
+                    item_id = item_id_from(path)
+                    self._json(200, service.claim(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/handoff"):
+                    item_id = item_id_from(path)
+                    self._json(201, service.handoff(item_id, body, actor, role))
+                elif path.startswith("/api/handoffs/") and path.endswith("/decision"):
+                    handoff_id = handoff_id_from(path)
+                    self._json(200, service.decide_handoff(
+                        handoff_id, body.get("decision"), actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
-                    item_id = int(path.split("/")[3])
+                    item_id = item_id_from(path)
                     self._json(201, service.add_record(item_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
-                    item_id = int(path.split("/")[3])
+                    item_id = item_id_from(path)
                     target = body.get("target")
                     expected = body.get("expected_version")
                     self._json(200, service.transition(

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, PermissionDenied
 from .rules import ID_PREFIX, STATES
 
 
@@ -65,6 +65,28 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    owner TEXT NOT NULL,
+                    claimed_version INTEGER NOT NULL,
+                    claimed_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_assignments_owner
+                    ON assignments(item_id);
+                CREATE TABLE IF NOT EXISTS handoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    from_owner TEXT NOT NULL,
+                    to_actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','confirmed','rejected')),
+                    requested_at TEXT NOT NULL,
+                    decided_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_handoffs_pending
+                    ON handoffs(item_id) WHERE status='pending';
             """)
 
     @staticmethod
@@ -156,6 +178,98 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def get_assignment(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM assignments WHERE item_id=?", (item_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_handoff(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM handoffs WHERE item_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def claim(self, item_id: int, owner: str, expected_version: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT version FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            if int(row["version"]) != expected_version:
+                raise ConflictError("版本已过期，请基于当前版本领单")
+            try:
+                cur = self.conn.execute(
+                    """INSERT INTO assignments(item_id, owner, claimed_version, claimed_at)
+                       VALUES(?,?,?,?)""",
+                    (item_id, owner, expected_version, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("该事件已被领办，同一事件只留一名领办人") from exc
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM assignments WHERE id=?", (int(cur.lastrowid),)
+            ).fetchone()
+        return dict(row)
+
+    def request_handoff(self, item_id: int, from_owner: str, to_actor: str,
+                        reason: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            try:
+                cur = self.conn.execute(
+                    """INSERT INTO handoffs(item_id, from_owner, to_actor, reason,
+                       status, requested_at) VALUES(?,?,?,?,'pending',?)""",
+                    (item_id, from_owner, to_actor, reason, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("已有待确认的交接，请等待接收人处理") from exc
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM handoffs WHERE id=?", (int(cur.lastrowid),)
+            ).fetchone()
+        return dict(row)
+
+    def resolve_handoff(self, handoff_id: int, decision: str,
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        status = "confirmed" if decision == "confirm" else "rejected"
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM handoffs WHERE id=?", (handoff_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("交接不存在")
+            handoff = dict(row)
+            if handoff["status"] != "pending":
+                raise ConflictError("该交接已处理，不能重复操作")
+            if handoff["to_actor"] != actor:
+                raise PermissionDenied("只有指定接收人可以处理该交接")
+            self.conn.execute(
+                "UPDATE handoffs SET status=?, decided_at=? WHERE id=?",
+                (status, now, handoff_id),
+            )
+            if decision == "confirm":
+                version_row = self.conn.execute(
+                    "SELECT version FROM items WHERE id=?", (handoff["item_id"],)
+                ).fetchone()
+                claimed_version = int(version_row["version"]) if version_row else None
+                self.conn.execute(
+                    """UPDATE assignments SET owner=?, claimed_version=?, claimed_at=?
+                       WHERE item_id=?""",
+                    (actor, claimed_version, now, handoff["item_id"]),
+                )
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM handoffs WHERE id=?", (handoff_id,)
+            ).fetchone()
+        return dict(row)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
