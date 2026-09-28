@@ -119,6 +119,19 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/claim"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.claim(
+                        item_id, body.get("expected_version"), actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/transfer"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.transfer(item_id, body, actor, role))
+                elif path.startswith("/api/transfers/") and path.endswith("/confirm"):
+                    transfer_id = int(path.split("/")[3])
+                    self._json(200, service.confirm_transfer(transfer_id, actor, role))
+                elif path.startswith("/api/transfers/") and path.endswith("/reject"):
+                    transfer_id = int(path.split("/")[3])
+                    self._json(200, service.reject_transfer(transfer_id, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

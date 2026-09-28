@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .domain import ConflictError, NotFoundError, PermissionDenied
+from .rules import CLAIMABLE_STATUS, ID_PREFIX, STATES
 
 
 class Repository:
@@ -21,6 +21,13 @@ class Repository:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        columns = [row[1] for row in self.conn.execute("PRAGMA table_info(items)").fetchall()]
+        if "owner" not in columns:
+            with self.conn:
+                self.conn.execute("ALTER TABLE items ADD COLUMN owner TEXT")
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
@@ -35,6 +42,7 @@ class Repository:
                     threshold REAL NOT NULL DEFAULT 1,
                     status TEXT NOT NULL CHECK(status IN ({statuses})),
                     version INTEGER NOT NULL DEFAULT 1,
+                    owner TEXT,
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -42,6 +50,19 @@ class Repository:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
                     ON items(external_ref) WHERE external_ref IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS transfers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    from_actor TEXT NOT NULL,
+                    to_actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','confirmed','rejected')),
+                    created_at TEXT NOT NULL,
+                    decided_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_transfers_pending
+                    ON transfers(item_id) WHERE status='pending';
                 CREATE TABLE IF NOT EXISTS records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
@@ -122,6 +143,89 @@ class Repository:
                     raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
+
+    def claim_item(self, item_id: int, actor: str,
+                   expected_version: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET owner=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=? AND owner IS NULL AND status=?""",
+                (actor, now, item_id, expected_version, CLAIMABLE_STATUS),
+            )
+            if cur.rowcount == 0:
+                row = self.conn.execute(
+                    "SELECT status, owner FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError("项目不存在")
+                if row["owner"] is not None:
+                    raise ConflictError("该事件已有领办人，不能重复领单")
+                if row["status"] != CLAIMABLE_STATUS:
+                    raise ConflictError("事件未在评估阶段，不能领办")
+                raise ConflictError("版本冲突，请刷新后重试")
+        return self.get_item(item_id)
+
+    def create_transfer(self, item_id: int, from_actor: str,
+                        to_actor: str, reason: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO transfers(item_id, from_actor, to_actor, reason,
+                       status, created_at) VALUES(?,?,?,?, 'pending', ?)""",
+                    (item_id, from_actor, to_actor, reason, now),
+                )
+                transfer_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("该事件已有待确认的交接，不能重复发起") from exc
+        return self.get_transfer(transfer_id)
+
+    def get_transfer(self, transfer_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM transfers WHERE id=?", (transfer_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("交接记录不存在")
+        return dict(row)
+
+    def get_pending_transfer(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM transfers WHERE item_id=? AND status='pending'
+                   ORDER BY id DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def decide_transfer(self, transfer_id: int, decision: str,
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM transfers WHERE id=?", (transfer_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("交接记录不存在")
+            if row["status"] != "pending":
+                raise ConflictError("交接已处理，不能重复操作")
+            if row["to_actor"] != actor:
+                raise PermissionDenied("只有接收人可以确认或驳回该交接")
+            if decision == "confirmed":
+                self.conn.execute(
+                    """UPDATE items SET owner=?, version=version+1, updated_at=?
+                       WHERE id=?""",
+                    (actor, now, row["item_id"]),
+                )
+            self.conn.execute(
+                "UPDATE transfers SET status=?, decided_at=? WHERE id=?",
+                (decision, now, transfer_id),
+            )
+            updated = self.conn.execute(
+                "SELECT * FROM transfers WHERE id=?", (transfer_id,)
+            ).fetchone()
+        return dict(updated)
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
